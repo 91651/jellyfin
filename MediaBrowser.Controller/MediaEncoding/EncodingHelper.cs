@@ -859,8 +859,8 @@ namespace MediaBrowser.Controller.MediaEncoding
                 && !state.SubtitleStream.IsTextSubtitleStream
                 && !string.Equals(state.SubtitleStream.Codec, "DVBSUB", StringComparison.OrdinalIgnoreCase))
             {
-                var subtitleWidth = state.SubtitleStream?.Width;
-                var subtitleHeight = state.SubtitleStream?.Height;
+                var subtitleWidth = state.SubtitleStream?.Width ?? state.VideoStream?.Width;
+                var subtitleHeight = state.SubtitleStream?.Height ?? state.VideoStream?.Height;
 
                 if (subtitleWidth.HasValue
                     && subtitleHeight.HasValue
