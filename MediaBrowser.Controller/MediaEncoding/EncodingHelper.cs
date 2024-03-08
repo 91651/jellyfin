@@ -219,6 +219,14 @@ namespace MediaBrowser.Controller.MediaEncoding
                    && _mediaEncoder.SupportsFilter("hwupload_vaapi");
         }
 
+        private bool IsVideoToolBoxFullSupported()
+        {
+            return _mediaEncoder.SupportsHwaccel("videotoolbox")
+                   && _mediaEncoder.SupportsFilter("yadif_videotoolbox")
+                   && _mediaEncoder.SupportsFilter("overlay_videotoolbox")
+                   && _mediaEncoder.SupportsFilter("scale_vt");
+        }
+
         private bool IsRkmppFullSupported()
         {
             return _mediaEncoder.SupportsHwaccel("rkmpp")
@@ -272,7 +280,8 @@ namespace MediaBrowser.Controller.MediaEncoding
                 var isNvdecDecoder = vidDecoder.Contains("cuda", StringComparison.OrdinalIgnoreCase);
                 var isVaapiDecoder = vidDecoder.Contains("vaapi", StringComparison.OrdinalIgnoreCase);
                 var isD3d11vaDecoder = vidDecoder.Contains("d3d11va", StringComparison.OrdinalIgnoreCase);
-                return isSwDecoder || isNvdecDecoder || isVaapiDecoder || isD3d11vaDecoder;
+                var isVideoToolBoxDecoder = vidDecoder.Contains("videotoolbox", StringComparison.OrdinalIgnoreCase);
+                return isSwDecoder || isNvdecDecoder || isVaapiDecoder || isD3d11vaDecoder || isVideoToolBoxDecoder;
             }
 
             return state.VideoStream.VideoRange == VideoRange.HDR
@@ -306,6 +315,20 @@ namespace MediaBrowser.Controller.MediaEncoding
 
             return state.VideoStream.VideoRange == VideoRange.HDR
                    && state.VideoStream.VideoRangeType == VideoRangeType.HDR10;
+        }
+
+        private bool IsVideoToolBoxTonemapAvailable(EncodingJobInfo state, EncodingOptions options)
+        {
+            if (state.VideoStream is null
+                || !options.EnableVideoToolboxTonemapping
+                || GetVideoColorBitDepth(state) != 10)
+            {
+                return false;
+            }
+
+            // Videotoolbox lacks of Dolby Vision to SDR tonemapping support.
+            return state.VideoStream.VideoRange == VideoRange.HDR
+                   && state.VideoStream.VideoRangeType is VideoRangeType.HDR10 or VideoRangeType.HLG or VideoRangeType.HDR10Plus;
         }
 
         /// <summary>
@@ -3492,7 +3515,6 @@ namespace MediaBrowser.Controller.MediaEncoding
             var isSwEncoder = !isNvencEncoder;
             var isCuInCuOut = isNvDecoder && isNvencEncoder;
 
-            var doubleRateDeint = options.DeinterlaceDoubleRate && (state.VideoStream?.AverageFrameRate ?? 60) <= 30;
             var doDeintH264 = state.DeInterlace("h264", true) || state.DeInterlace("avc", true);
             var doDeintHevc = state.DeInterlace("h265", true) || state.DeInterlace("hevc", true);
             var doDeintH2645 = doDeintH264 || doDeintHevc;
@@ -4954,22 +4976,30 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return (null, null, null);
             }
 
-            var swFilterChain = GetSwVidFilterChain(state, options, vidEncoder);
+            var isMacOS = OperatingSystem.IsMacOS();
+            var vidDecoder = GetHardwareVideoDecoder(state, options) ?? string.Empty;
+            var isVtEncoder = vidEncoder.Contains("videotoolbox", StringComparison.OrdinalIgnoreCase);
+            var isVtFullSupported = isMacOS && IsVideoToolBoxFullSupported();
+            var isVtOclSupported = isVtFullSupported && IsOpenclFullSupported();
 
-            if (!options.EnableHardwareEncoding)
+            // legacy videotoolbox pipeline (disable hw filters)
+            if (!isVtEncoder
+                || !isVtOclSupported
+                || !_mediaEncoder.SupportsFilter("alphasrc"))
             {
-                return swFilterChain;
+                return GetSwVidFilterChain(state, options, vidEncoder);
             }
 
-            if (_mediaEncoder.EncoderVersion.CompareTo(new Version("5.0.0")) < 0)
-            {
-                // All features used here requires ffmpeg 5.0 or later, fallback to software filters if using an old ffmpeg
-                return swFilterChain;
-            }
+            // prefered videotoolbox + vt/ocl filters pipeline
+            return GetAppleVidFiltersPrefered(state, options, vidDecoder, vidEncoder);
+        }
 
-            var doDeintH264 = state.DeInterlace("h264", true) || state.DeInterlace("avc", true);
-            var doDeintHevc = state.DeInterlace("h265", true) || state.DeInterlace("hevc", true);
-            var doDeintH2645 = doDeintH264 || doDeintHevc;
+        public (List<string> MainFilters, List<string> SubFilters, List<string> OverlayFilters) GetAppleVidFiltersPrefered(
+            EncodingJobInfo state,
+            EncodingOptions options,
+            string vidDecoder,
+            string vidEncoder)
+        {
             var inW = state.VideoStream?.Width;
             var inH = state.VideoStream?.Height;
             var reqW = state.BaseRequest.Width;
@@ -4977,33 +5007,104 @@ namespace MediaBrowser.Controller.MediaEncoding
             var reqMaxW = state.BaseRequest.MaxWidth;
             var reqMaxH = state.BaseRequest.MaxHeight;
             var threeDFormat = state.MediaSource.Video3DFormat;
-            var newfilters = new List<string>();
-            var noOverlay = swFilterChain.OverlayFilters.Count == 0;
-            var supportsHwDeint = _mediaEncoder.SupportsFilter("yadif_videotoolbox");
-            // fallback to software filters if we are using filters not supported by hardware yet.
-            var useHardwareFilters = noOverlay && (!doDeintH2645 || supportsHwDeint);
 
-            if (!useHardwareFilters)
+            var isVtEncoder = vidEncoder.Contains("videotoolbox", StringComparison.OrdinalIgnoreCase);
+
+            var doDeintH264 = state.DeInterlace("h264", true) || state.DeInterlace("avc", true);
+            var doDeintHevc = state.DeInterlace("h265", true) || state.DeInterlace("hevc", true);
+            var doDeintH2645 = doDeintH264 || doDeintHevc;
+            var doVtTonemap = IsVideoToolBoxTonemapAvailable(state, options);
+            var doOclTonemap = !doVtTonemap && IsHwTonemapAvailable(state, options);
+            var doTonemap = doVtTonemap || doOclTonemap;
+
+            var hasSubs = state.SubtitleStream is not null && state.SubtitleDeliveryMethod == SubtitleDeliveryMethod.Encode;
+            var hasTextSubs = hasSubs && state.SubtitleStream.IsTextSubtitleStream;
+            var hasGraphicalSubs = hasSubs && !state.SubtitleStream.IsTextSubtitleStream;
+            var hasAssSubs = hasSubs
+                && (string.Equals(state.SubtitleStream.Codec, "ass", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(state.SubtitleStream.Codec, "ssa", StringComparison.OrdinalIgnoreCase));
+
+            // FIXME: scale_vt lacks of format option for the time being.
+            // hwdownload/hwmap to sw requires setting a format explicitly.
+            if (!isVtEncoder)
             {
-                return swFilterChain;
+                // should not happen.
+                return (null, null, null);
             }
 
-            // ffmpeg cannot use videotoolbox to scale
-            var swScaleFilter = GetSwScaleFilter(state, options, vidEncoder, inW, inH, threeDFormat, reqW, reqH, reqMaxW, reqMaxH);
-            newfilters.Add(swScaleFilter);
+            /* Make main filters for video stream */
+            var mainFilters = new List<string>();
 
-            // hwupload on videotoolbox encoders can automatically convert AVFrame into its CVPixelBuffer equivalent
-            // videotoolbox will automatically convert the CVPixelBuffer to a pixel format the encoder supports, so we don't have to set a pixel format explicitly here
-            // This will reduce CPU usage significantly on UHD videos with 10 bit colors because we bypassed the ffmpeg pixel format conversion
-            newfilters.Add("hwupload");
+            mainFilters.Add(GetOverwriteColorPropertiesParam(state, doTonemap));
 
+            // INPUT videotoolbox/memory surface(vram/uma)
+            // this will passthrough automatically if in/out format matches.
+            mainFilters.Add("format=nv12|p010le|videotoolbox_vld");
+            mainFilters.Add("hwupload=derive_device=videotoolbox");
+
+            // hw deint
             if (doDeintH2645)
             {
                 var deintFilter = GetHwDeinterlaceFilter(state, options, "videotoolbox");
-                newfilters.Add(deintFilter);
+                mainFilters.Add(deintFilter);
             }
 
-            return (newfilters, swFilterChain.SubFilters, swFilterChain.OverlayFilters);
+            var hwScaleFilter = GetHwScaleFilter("vt", null, inW, inH, reqW, reqH, reqMaxW, reqMaxH);
+            if (doVtTonemap)
+            {
+                const string vtTonemapArgs = "color_matrix=bt709:color_primaries=bt709:color_transfer=bt709";
+
+                // scale_vt can handle scaling & tonemapping in one shot, just like vpp_qsv.
+                hwScaleFilter = string.IsNullOrEmpty(hwScaleFilter)
+                    ? "scale_vt=" + vtTonemapArgs
+                    : hwScaleFilter + ":" + vtTonemapArgs;
+            }
+
+            // hw scale & vt tonemap
+            mainFilters.Add(hwScaleFilter);
+
+            // ocl tonemap
+            if (doOclTonemap)
+            {
+                // map from videotoolbox to opencl via videotoolbox-opencl interop.
+                mainFilters.Add("hwmap=derive_device=opencl:mode=read");
+
+                var tonemapFilter = GetHwTonemapFilter(options, "opencl", "nv12");
+                mainFilters.Add(tonemapFilter);
+
+                // OUTPUT videotoolbox(nv12) surface(vram/uma)
+                // reverse-mapping via videotoolbox-opencl interop.
+                mainFilters.Add("hwmap=derive_device=videotoolbox:mode=write:reverse=1");
+            }
+
+            /* Make sub and overlay filters for subtitle stream */
+            var subFilters = new List<string>();
+            var overlayFilters = new List<string>();
+            if (hasSubs)
+            {
+                if (hasGraphicalSubs)
+                {
+                    var subPreProcFilters = GetGraphicalSubPreProcessFilters(inW, inH, reqW, reqH, reqMaxW, reqMaxH);
+                    subFilters.Add(subPreProcFilters);
+                    subFilters.Add("format=bgra");
+                }
+                else if (hasTextSubs)
+                {
+                    var framerate = state.VideoStream?.RealFrameRate;
+                    var subFramerate = hasAssSubs ? Math.Min(framerate ?? 25, 60) : 10;
+
+                    var alphaSrcFilter = GetAlphaSrcFilter(state, inW, inH, reqW, reqH, reqMaxW, reqMaxH, subFramerate);
+                    var subTextSubtitlesFilter = GetTextSubtitlesFilter(state, true, true);
+                    subFilters.Add(alphaSrcFilter);
+                    subFilters.Add("format=bgra");
+                    subFilters.Add(subTextSubtitlesFilter);
+                }
+
+                subFilters.Add("hwupload=derive_device=videotoolbox");
+                overlayFilters.Add("overlay_videotoolbox=eof_action=pass:repeatlast=0");
+            }
+
+            return (mainFilters, subFilters, overlayFilters);
         }
 
         /// <summary>
@@ -5991,6 +6092,29 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return null;
             }
 
+            var doVtTonemap = IsVideoToolBoxTonemapAvailable(state, options);
+            var doOclTonemap = !doVtTonemap
+                && options.EnableTonemapping
+                && state.VideoStream is not null
+                && GetVideoColorBitDepth(state) == 10
+                && state.VideoStream.VideoRange == VideoRange.HDR
+                && (state.VideoStream.VideoRangeType == VideoRangeType.HDR10
+                    || state.VideoStream.VideoRangeType == VideoRangeType.HLG
+                    || (state.VideoStream.VideoRangeType == VideoRangeType.DOVI
+                        && string.Equals(state.VideoStream.Codec, "hevc", StringComparison.OrdinalIgnoreCase)));
+
+            var vidEncoder = GetVideoEncoder(state, options);
+            var isVtEncoder = vidEncoder.Contains("videotoolbox", StringComparison.OrdinalIgnoreCase);
+
+            // FIXME: videotoolbox's hw surface causes vt tonemap to output incorrect color.
+            // see also https://trac.ffmpeg.org/ticket/10884
+            // only enable it for the ocl tonemap use case.
+            var hwSurface = doOclTonemap
+                && isVtEncoder
+                && IsVideoToolBoxFullSupported()
+                && IsOpenclFullSupported()
+                && _mediaEncoder.SupportsFilter("alphasrc");
+
             var is8bitSwFormatsVt = string.Equals("yuv420p", videoStream.PixelFormat, StringComparison.OrdinalIgnoreCase)
                                     || string.Equals("yuvj420p", videoStream.PixelFormat, StringComparison.OrdinalIgnoreCase);
             var is8_10bitSwFormatsVt = is8bitSwFormatsVt || string.Equals("yuv420p10le", videoStream.PixelFormat, StringComparison.OrdinalIgnoreCase);
@@ -6000,17 +6124,17 @@ namespace MediaBrowser.Controller.MediaEncoding
                 if (string.Equals("avc", videoStream.Codec, StringComparison.OrdinalIgnoreCase)
                     || string.Equals("h264", videoStream.Codec, StringComparison.OrdinalIgnoreCase))
                 {
-                    return GetHwaccelType(state, options, "h264", bitDepth, false);
+                    return GetHwaccelType(state, options, "h264", bitDepth, hwSurface);
                 }
 
                 if (string.Equals("mpeg2video", videoStream.Codec, StringComparison.OrdinalIgnoreCase))
                 {
-                    return GetHwaccelType(state, options, "mpeg2video", bitDepth, false);
+                    return GetHwaccelType(state, options, "mpeg2video", bitDepth, hwSurface);
                 }
 
                 if (string.Equals("mpeg4", videoStream.Codec, StringComparison.OrdinalIgnoreCase))
                 {
-                    return GetHwaccelType(state, options, "mpeg4", bitDepth, false);
+                    return GetHwaccelType(state, options, "mpeg4", bitDepth, hwSurface);
                 }
             }
 
@@ -6019,12 +6143,12 @@ namespace MediaBrowser.Controller.MediaEncoding
                 if (string.Equals("hevc", videoStream.Codec, StringComparison.OrdinalIgnoreCase)
                     || string.Equals("h265", videoStream.Codec, StringComparison.OrdinalIgnoreCase))
                 {
-                    return GetHwaccelType(state, options, "hevc", bitDepth, false);
+                    return GetHwaccelType(state, options, "hevc", bitDepth, hwSurface);
                 }
 
                 if (string.Equals("vp9", videoStream.Codec, StringComparison.OrdinalIgnoreCase))
                 {
-                    return GetHwaccelType(state, options, "vp9", bitDepth, false);
+                    return GetHwaccelType(state, options, "vp9", bitDepth, hwSurface);
                 }
             }
 
